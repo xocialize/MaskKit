@@ -116,6 +116,18 @@ public struct TextQuad: Sendable, Equatable {
 }
 
 /// One detected text region.
+/// One recognised word inside a `TextRegion` line — its own quad, from `VNRecognizedText.boundingBox(for:)`.
+/// Word granularity exists for `TextLegibilityGuard`: protecting a whole line to keep one legible word
+/// measured too coarse (it also freezes the words on that line the generative tier would have fixed).
+public struct TextWord: Sendable, Equatable {
+    public var text: String
+    public var quad: TextQuad
+    public init(text: String, quad: TextQuad) {
+        self.text = text
+        self.quad = quad
+    }
+}
+
 public struct TextRegion: Sendable, Equatable {
     public enum Source: String, Sendable {
         /// `VNRecognizeTextRequest` — a string was produced, so the region is certainly text.
@@ -130,10 +142,14 @@ public struct TextRegion: Sendable, Equatable {
     public var transcript: String?
     public var confidence: Float
     public var source: Source
+    /// Per-word quads for a `.recognition` region (empty for `.detection`). Same pixel space as `quad`.
+    public var words: [TextWord]
 
-    public init(quad: TextQuad, transcript: String?, confidence: Float, source: Source) {
+    public init(quad: TextQuad, transcript: String?, confidence: Float, source: Source,
+                words: [TextWord] = []) {
         self.quad = quad; self.transcript = transcript
         self.confidence = confidence; self.source = source
+        self.words = words
     }
 }
 
@@ -220,6 +236,7 @@ public enum TextMaskDetector {
                 .map { region in
                     var moved = region
                     moved.quad = region.quad.offset(dx: tile.minX, dy: tile.minY)
+                    moved.words = region.words.map { TextWord(text: $0.text, quad: $0.quad.offset(dx: tile.minX, dy: tile.minY)) }
                     return moved
                 }
         }
@@ -279,11 +296,13 @@ public enum TextMaskDetector {
 
         for observation in recognize.results ?? [] {
             guard observation.confidence >= options.minimumConfidence else { continue }
+            let candidate = observation.topCandidates(1).first
             out.append(TextRegion(
                 quad: quad(from: observation, width: CGFloat(tile.width), height: tileHeight),
-                transcript: observation.topCandidates(1).first?.string,
+                transcript: candidate?.string,
                 confidence: observation.confidence,
-                source: .recognition))
+                source: .recognition,
+                words: candidate.map { words(of: $0, width: CGFloat(tile.width), height: tileHeight) } ?? []))
         }
 
         if options.includeDetectionOnlyPass {
@@ -313,6 +332,27 @@ public enum TextMaskDetector {
                         topRight: point(observation.bottomRight),
                         bottomRight: point(observation.topRight),
                         bottomLeft: point(observation.topLeft))
+    }
+
+    /// Whitespace-separated words of a recognised line, each with its own quad. Vision reports lines; the
+    /// per-word geometry comes from `boundingBox(for:)` on the candidate. A word whose box Vision cannot
+    /// produce is skipped rather than approximated — an invented box would protect the wrong pixels.
+    static func words(of candidate: VNRecognizedText, width: CGFloat, height: CGFloat) -> [TextWord] {
+        let string = candidate.string
+        var result: [TextWord] = []
+        var index = string.startIndex
+        while index < string.endIndex {
+            while index < string.endIndex, string[index].isWhitespace { index = string.index(after: index) }
+            guard index < string.endIndex else { break }
+            var end = index
+            while end < string.endIndex, !string[end].isWhitespace { end = string.index(after: end) }
+            if let box = try? candidate.boundingBox(for: index..<end) {
+                result.append(TextWord(text: String(string[index..<end]),
+                                       quad: quad(from: box, width: width, height: height)))
+            }
+            index = end
+        }
+        return result
     }
 
     // MARK: - Tiling
