@@ -39,7 +39,7 @@ your own: anything that turns a prompt into a grayscale mask conforms, including
 ## Install
 
 ```swift
-.package(url: "https://github.com/xocialize/MaskKit.git", from: "0.3.0")
+.package(url: "https://github.com/xocialize/MaskKit.git", from: "0.4.0")
 ```
 
 Zero dependencies. MIT.
@@ -52,16 +52,16 @@ than behind a protocol:
 - **`TextMaskDetector`** (v0.2.0) — every text region in an image, tiled at 1024 px (tiling, not
   Vision's `minimumTextHeight`, is what finds small text), as quads with transcripts, confidences and
   **per-word quads** (v0.3.0), plus a white-on-text mask with dilation and feather.
-- **`TextLegibilityGuard`** (v0.3.0) — the guard in front of a *generative* restoration or upscale
-  tier. It reads the input, reports the words the input already reads with certainty, and recommends a
-  route:
+- **`TextLegibilityGuard`** (v0.3.0; routes opt-in since v0.4.0) — the guard in front of a *generative*
+  restoration or upscale tier. It reads the input, reports the words the input already reads with
+  certainty, and recommends a route:
 
 ```swift
 let verdict = try TextLegibilityGuard.assess(input)          // Vision, synchronous — call off the main actor
 switch verdict.recommendation {
-case .keepBase:     /* a legible document page: run the non-generative tier only */
-case .generative:   /* nothing certain: run the generative tier */
-case .protectWords: /* opt-in only: run both, then */
+case .generative:   /* the default: run the generative tier */
+case .keepBase:     /* opt-in (`documentGate`): a legible document page → the non-generative tier only */
+case .protectWords: /* opt-in (`wordProtection`): run both, then */
     let mask = try TextLegibilityGuard.mask(for: verdict, width: out.width, height: out.height)
     let image = try TextLegibilityGuard.composite(base: fidelityOutput, generative: generativeOutput, mask: mask)
 }
@@ -81,9 +81,18 @@ images with ground truth + 130 ScreenSR pages; receipts in `mlxengine-forge/Tool
 - the image-level **document gate** (≥ 10 certain words on ≥ 50 % certain lines) never fired on the
   1,200 illegible inputs and cut corruption 59 → 3 on the pages it routed to the base tier.
 
-So `Policy.default` is **document gate on, `wordProtection` off**. Turn word protection on only for
-content you have measured (dense legible text at ×1); its dilation and feather are glyph-proportional
-(0.5× / 0.15× the word height) because a fixed few pixels let the seam cut through ascenders.
+Then the end-to-end run through the real tiers (ForgeCore's `GuardedUpscaleLiveTests`: SeedVR2-3B ×2 as
+the generative tier, Real-ESRGAN ×2 as the base, three ScreenSR pages) inverted the gate's premise for
+*that* pair: the generative route read best on every page (word-F1 0.937 / 0.913 / 0.651 against the
+input's 0.937 / 0.846 / 0.116) and the base tier read **worse than the un-restored input** on the dense
+pages (0.800 / 0.633) — Real-ESRGAN breaks and merges small strokes. A routing policy measured for one
+tier pair at one scale does not transfer to another.
+
+So `Policy.default` routes **`.generative` for everything**: `documentGate` and `wordProtection` are both
+opt-in, to be enabled only for a tier pair you have measured through the tiers it will route between. The
+verdict still reports the lines, the certain words and `isDocumentPage`, so a UI can show what a route
+would do. Word protection's dilation and feather are glyph-proportional (0.5× / 0.15× the word height)
+because a fixed few pixels let the seam cut through ascenders.
 
 Product rule this enforces: *an honestly-blurry STOP beats a razor-sharp SIOP.* Where the guard says
 `.keepBase`, run conservative, non-generative restoration.

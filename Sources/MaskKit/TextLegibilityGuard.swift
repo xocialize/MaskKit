@@ -19,9 +19,17 @@
 //   • the image-level DOCUMENT GATE is the policy that is safe everywhere: it never fired on the illegible sets
 //     (0 / 1,200 images) and, on the legible pages it routes to the base tier, corruption fell 59 → 3.
 //
-// Hence the defaults: **document gate on, word protection OFF.** `Policy.wordProtection = true` turns the
-// composite route on for a caller who has measured it on their content (dense legible text at ×1 is where it
-// pays). The verdict always reports the certain words, so a UI can show what would be protected.
+// 🚨 And the end-to-end run through the real tiers (ForgeCore `GuardedUpscaleLiveTests`, SeedVR2-3B int8 ×2 as
+// the generative tier, Real-ESRGAN ×2 as the base, three ScreenSR pages) inverted the gate's premise for THAT
+// pair: the generative route read best on every page (word-F1 0.937 / 0.913 / 0.651 vs the input's 0.937 /
+// 0.846 / 0.116) and the base tier read WORSE than the un-restored input on the dense pages (0.800 / 0.633) —
+// Real-ESRGAN breaks and merges small strokes. A routing policy measured for one tier pair at one scale (VOSR2
+// at ×1 vs its own input) does not transfer to another (SeedVR2 at ×2 vs Real-ESRGAN).
+//
+// Hence the defaults: **every route is opt-in — `documentGate` off, `wordProtection` off — so an unmeasured tier
+// pair gets `.generative`.** Turn a route on only after measuring it through the tiers it will actually route
+// between (the live test is the harness). The verdict always reports the lines, the certain words and whether
+// the frame looks like a document page, so a UI can show what a route would do before it is enabled.
 //
 // Doctrine: category A (Vision + CoreGraphics only, CPU, macOS 14). The composite here is the CGImage reference
 // path; an app blends its own GPU-resident buffers with the mask this type produces.
@@ -46,6 +54,10 @@ public enum TextLegibilityGuard {
         public var minimumConfidence: Float
         /// Alphanumeric characters a word needs to count as text worth protecting (drops punctuation debris).
         public var minimumWordLength: Int
+        /// Route a legible document page to the base tier whole (`.keepBase`). **Off by default** — it was the
+        /// safe policy against VOSR2 at ×1, and the WRONG one against SeedVR2 ×2 with Real-ESRGAN as the base
+        /// (see the type comment). Enable it only for a tier pair you have measured.
+        public var documentGate: Bool
         /// Route certain words to the base tier under a feathered mask (`.protectWords`). **Off by default —
         /// measured net-negative on inputs whose certain reads are mostly wrong** (see the type comment); turn it
         /// on for content you have measured (dense legible text at ×1 is where it pays).
@@ -69,6 +81,7 @@ public enum TextLegibilityGuard {
         public init(granularity: Granularity = .word,
                     minimumConfidence: Float = 0.9,
                     minimumWordLength: Int = 2,
+                    documentGate: Bool = false,
                     wordProtection: Bool = false,
                     dilationFraction: Double = 0.5,
                     featherFraction: Double = 0.15,
@@ -80,6 +93,7 @@ public enum TextLegibilityGuard {
             self.granularity = granularity
             self.minimumConfidence = minimumConfidence
             self.minimumWordLength = minimumWordLength
+            self.documentGate = documentGate
             self.wordProtection = wordProtection
             self.dilationFraction = dilationFraction
             self.featherFraction = featherFraction
@@ -101,12 +115,14 @@ public enum TextLegibilityGuard {
         public var protected: [TextQuad]
         /// Certain lines / all recognised lines (0 when nothing was recognised).
         public var certainLineShare: Double
-        /// Whether the policy that produced this verdict routes certain words to the base tier.
+        /// Whether the policy that produced this verdict routes document pages / certain words to the base tier.
+        public var documentGate: Bool
         public var wordProtection: Bool
         /// Source image size, so the mask can be rendered at any output scale.
         public var width: Int
         public var height: Int
-        /// True when the frame reads as a legible document page under the policy's document gate.
+        /// True when the frame reads as a legible document page (≥ `documentMinimumWords` certain words on
+        /// ≥ `documentCertainShare` of its lines) — a reported fact; it only routes when `documentGate` is on.
         public var isDocumentPage: Bool
 
         public var firesOnText: Bool { !protected.isEmpty }
@@ -118,11 +134,11 @@ public enum TextLegibilityGuard {
         }
         /// The recommendation a planner acts on.
         public enum Recommendation: String, Sendable { case generative, protectWords, keepBase }
-        /// `.keepBase` for a legible document page; `.protectWords` only when the policy opted in AND certain words
-        /// exist; otherwise `.generative` — the measured default (the generative tier fixes more than it breaks
-        /// everywhere except dense legible pages, and those are what the document gate catches).
+        /// `.keepBase` only when the policy opted into the document gate AND the frame is a document page;
+        /// `.protectWords` only when the policy opted in AND certain words exist; otherwise `.generative` — the
+        /// default for any tier pair that has not been measured (see the type comment).
         public var recommendation: Recommendation {
-            if isDocumentPage { return .keepBase }
+            if documentGate && isDocumentPage { return .keepBase }
             return (wordProtection && !protected.isEmpty) ? .protectWords : .generative
         }
     }
@@ -158,7 +174,7 @@ public enum TextLegibilityGuard {
         let share = regions.isEmpty ? 0 : Double(certain.count) / Double(regions.count)
         let isDocument = certainWords >= policy.documentMinimumWords && share >= policy.documentCertainShare
         return Verdict(regions: regions, protected: protected, certainLineShare: share,
-                       wordProtection: policy.wordProtection,
+                       documentGate: policy.documentGate, wordProtection: policy.wordProtection,
                        width: width, height: height, isDocumentPage: isDocument)
     }
 

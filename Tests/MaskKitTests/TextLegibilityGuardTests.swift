@@ -51,22 +51,26 @@ final class TextLegibilityGuardTests: XCTestCase {
         var lines: [TextRegion] = []
         for i in 0..<6 { lines.append(line(y: CGFloat(10 + i * 30), confidence: 1.0, words: [("WORD", 10, 80), ("MORE", 100, 170)])) }
         let v = TextLegibilityGuard.verdict(regions: lines, width: 400, height: 300, policy: .default)
-        XCTAssertTrue(v.isDocumentPage, "12 certain words on all-certain lines is a document page")
-        XCTAssertEqual(v.recommendation, .keepBase)
+        XCTAssertTrue(v.isDocumentPage, "12 certain words on all-certain lines is a document page — a reported fact")
+        XCTAssertEqual(v.recommendation, .generative, "the gate is opt-in: a document page routes generative by default (SeedVR2 ×2 read better than the base on every dense page measured)")
+
+        let gated = TextLegibilityGuard.verdict(regions: lines, width: 400, height: 300, policy: .init(documentGate: true))
+        XCTAssertEqual(gated.recommendation, .keepBase, "opting into the gate routes the page to the base tier")
 
         let off = TextLegibilityGuard.verdict(regions: lines, width: 400, height: 300,
-                                              policy: .init(documentMinimumWords: Int.max))
+                                              policy: .init(documentGate: true, documentMinimumWords: Int.max))
         XCTAssertFalse(off.isDocumentPage)
-        XCTAssertEqual(off.recommendation, .generative, "no gate, no opt-in → generative")
+        XCTAssertEqual(off.recommendation, .generative, "gate on but the page does not qualify → generative")
         XCTAssertEqual(TextLegibilityGuard.verdict(regions: lines, width: 400, height: 300,
                                                    policy: .init(wordProtection: true, documentMinimumWords: Int.max)).recommendation,
                        .protectWords)
 
         // Half the lines uncertain → below the certain share → no document gate, words still protected.
         let mixed = lines + (0..<6).map { line(y: CGFloat(200 + $0 * 10), confidence: 0.5, words: [("BLUR", 10, 80)]) }
-        let m = TextLegibilityGuard.verdict(regions: mixed, width: 400, height: 300, policy: .default)
+        let m = TextLegibilityGuard.verdict(regions: mixed, width: 400, height: 300, policy: .init(documentGate: true))
         XCTAssertEqual(m.certainLineShare, 0.5, accuracy: 1e-9)
         XCTAssertTrue(m.isDocumentPage, "share exactly at the floor still counts")
+        XCTAssertEqual(m.recommendation, .keepBase)
         XCTAssertEqual(m.protected.count, 12)
     }
 
