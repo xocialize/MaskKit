@@ -214,10 +214,15 @@ public enum TextLegibilityGuard {
     // MARK: - Composite (CPU reference)
 
     /// `mask · base + (1 − mask) · generative`, all three at the output size. The reference implementation;
-    /// an app blends on its own textures with the same mask.
+    /// an app blends on its own textures with the same mask. When either tier's image is deeper than 8 bits (a 16-bit
+    /// model boundary, AB-T-0233) it composites at 16 bits, mask included, and returns a 16-bit image; otherwise 8 bits,
+    /// as always.
     public static func composite(base: CGImage, generative: CGImage, mask: CGImage) throws -> CGImage {
         let w = generative.width, h = generative.height
         guard base.width == w, base.height == h, mask.width == w, mask.height == h else { throw GuardError.sizeMismatch }
+        if base.bitsPerComponent > 8 || generative.bitsPerComponent > 8 {
+            return try composite16(base: base, generative: generative, mask: mask)
+        }
         let b = try rgba(base), g = try rgba(generative), m = try gray(mask)
         var out = [UInt8](repeating: 255, count: w * h * 4)
         for i in 0..<(w * h) {
@@ -234,6 +239,65 @@ public enum TextLegibilityGuard {
                                   provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
         else { throw GuardError.rasterFailed }
         return image
+    }
+
+    /// `composite` at 16 bits: both tiers and the mask read at 16 bits per component, blended in float, rounded once.
+    static func composite16(base: CGImage, generative: CGImage, mask: CGImage) throws -> CGImage {
+        let w = generative.width, h = generative.height
+        let b = try rgba16(base), g = try rgba16(generative), m = try gray16(mask)
+        var out = [UInt16](repeating: UInt16.max, count: w * h * 4)
+        blend16(b, g, m, into: &out, count: w * h)
+        let info = CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let provider = CGDataProvider(data: out.withUnsafeBytes { Data($0) } as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 16, bitsPerPixel: 64, bytesPerRow: w * 8,
+                                  space: space, bitmapInfo: CGBitmapInfo(rawValue: info),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { throw GuardError.rasterFailed }
+        return image
+    }
+
+    @inline(never)
+    static func blend16(_ b: [UInt16], _ g: [UInt16], _ m: [UInt16], into out: inout [UInt16], count: Int) {
+        for i in 0..<count {
+            let t = Float(m[i]) / 65535
+            for c in 0..<3 {
+                let v = t * Float(b[i * 4 + c]) + (1 - t) * Float(g[i * 4 + c])
+                out[i * 4 + c] = UInt16(max(0, min(65535, v.rounded())))
+            }
+        }
+    }
+
+    /// 16-bit RGBX words (sRGB, little-endian; an 8-bit image's values ×257, exactly).
+    static func rgba16(_ image: CGImage) throws -> [UInt16] {
+        let w = image.width, h = image.height
+        var words = [UInt16](repeating: 0, count: w * h * 4)
+        let ok: Bool = words.withUnsafeMutableBytes { raw in
+            guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+                  let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+            else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { throw GuardError.rasterFailed }
+        return words
+    }
+
+    /// The mask at 16 bits (an 8-bit mask's values ×257, exactly).
+    static func gray16(_ image: CGImage) throws -> [UInt16] {
+        let w = image.width, h = image.height
+        var words = [UInt16](repeating: 0, count: w * h)
+        let ok: Bool = words.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 2,
+                                      space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)
+            else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { throw GuardError.rasterFailed }
+        return words
     }
 
     static func rgba(_ image: CGImage) throws -> [UInt8] {

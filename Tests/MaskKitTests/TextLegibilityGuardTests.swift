@@ -107,6 +107,37 @@ final class TextLegibilityGuardTests: XCTestCase {
                                                                mask: try TextMaskDetector.grayImage([Float](repeating: 0, count: 16), width: 4, height: 4)))
     }
 
+    /// Deep tiers composite at 16 bits (AB-T-0233): a 16-bit ramp keeps its sub-8-bit values, the mask's feather blends in
+    /// float, and the result is a 16-bit image. Two 8-bit tiers still return 8 bits.
+    func testCompositeOfDeepTiersKeepsSixteenBits() throws {
+        let (w, h) = (64, 8)
+        func deep(_ value: (Int) -> UInt16) throws -> CGImage {
+            var words = [UInt16](repeating: UInt16.max, count: w * h * 4)
+            for y in 0..<h { for x in 0..<w { for c in 0..<3 { words[(y * w + x) * 4 + c] = value(x) } } }
+            return try XCTUnwrap(words.withUnsafeMutableBytes { raw in
+                CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 16, bytesPerRow: w * 8,
+                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue)?.makeImage()
+            })
+        }
+        let base = try deep { UInt16(20_000 + $0 * 7) }         // 7 sixteen-bit levels per px: under one 8-bit step
+        let gen = try deep { _ in 40_000 }
+        var plane = [Float](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w { plane[y * w + x] = x < 24 ? 1 : x < 40 ? Float(40 - x) / 16 : 0 } }
+        let mask = try TextMaskDetector.grayImage(plane, width: w, height: h)
+        let out = try TextLegibilityGuard.composite(base: base, generative: gen, mask: mask)
+        XCTAssertEqual(out.bitsPerComponent, 16)
+        let words = try TextLegibilityGuard.rgba16(out)
+        XCTAssertEqual(words[(2 * w + 5) * 4], 20_035, "inside the mask: the base's 16-bit value")
+        XCTAssertEqual(words[(2 * w + 60) * 4], 40_000, "outside: the generative tier's")
+        let ramp = (24..<40).map { words[(2 * w + $0) * 4] }
+        XCTAssertEqual(Set(ramp).count, ramp.count, "the feather blends at 16 bits: no two steps alike")
+        XCTAssertTrue(ramp.contains { $0 % 257 != 0 }, "off the 8-bit grid")
+        let eight = try TextLegibilityGuard.composite(base: try solid(width: w, height: h, r: 255, g: 0, b: 0),
+                                                      generative: try solid(width: w, height: h, r: 0, g: 0, b: 255), mask: mask)
+        XCTAssertEqual(eight.bitsPerComponent, 8, "two 8-bit tiers composite at 8 bits, as before")
+    }
+
     // MARK: - Vision, end to end: what it fires on
 
     func testFiresOnLegibleTextAndStaysSilentWhenTheSameTextIsUnreadable() throws {

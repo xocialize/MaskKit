@@ -67,6 +67,9 @@ case .protectWords: /* opt-in (`wordProtection`): run both, then */
 }
 ```
 
+`composite` keeps 16 bits (0.4.1, AB-T-0233): when either tier's image is deeper than 8 bits it reads both, and the mask,
+at 16 bits, blends in float and returns a 16-bit image. Two 8-bit tiers composite at 8 bits, byte for byte as before.
+
 **Defaults are measured, and the measurement inverted the obvious design** (2026-09-26, 1,200 SA-Text
 images with ground truth + 130 ScreenSR pages; receipts in `mlxengine-forge/Tools/vosr-gates/`):
 
