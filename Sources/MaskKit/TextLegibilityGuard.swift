@@ -38,6 +38,18 @@
 import CoreGraphics
 import Foundation
 
+/// A second reader for the guard's WORD CONFIRMATION (an agreement ensemble). It returns the text it read on the
+/// frame as free lines; the guard normalises them and keeps only the certain Vision words the second reader also
+/// read. Measured 2026-10-15 (AB-R-0556, SenseNova-U1.5 VQA on the SA-Text 200-subsets): Vision's certain words are
+/// right 73–82 % of the time on degraded input; the words BOTH readers read are right 97–98 % at 85–90 % of Vision's
+/// recall, because the two readers' errors are nearly disjoint. The second reader on its own is NOT a truth (it
+/// invents: 0.23–0.59 precision), which is why this is a confirmation, never a replacement, and why pages stay
+/// Vision-only (a VLM given a page it cannot read writes a page). MaskKit ships no reader — an app supplies one
+/// (ForgeCore backs it with the resident U1 package's analysis surface).
+public protocol TextSecondReader: Sendable {
+    func transcribe(_ image: CGImage) async throws -> [String]
+}
+
 public enum TextLegibilityGuard {
 
     public enum GuardError: Error, Equatable {
@@ -77,6 +89,10 @@ public enum TextLegibilityGuard {
         /// Detector options. Recognition only: legibility is a recognition question, and the detection-only
         /// pass exists for the opposite purpose (finding text that could NOT be read).
         public var detector: TextMaskDetector.Options
+        /// Keep only the certain words a `TextSecondReader` ALSO read (`confirm(_:with:policy:)`). **Off by
+        /// default.** With it on and no second reader supplied, the verdict is Vision's alone and says so
+        /// (`Verdict.confirmed == nil`). Word granularity only — lines are not confirmed.
+        public var wordConfirmation: Bool
 
         public init(granularity: Granularity = .word,
                     minimumConfidence: Float = 0.9,
@@ -89,7 +105,8 @@ public enum TextLegibilityGuard {
                     minimumFeather: Double = 2.0,
                     documentMinimumWords: Int = 10,
                     documentCertainShare: Double = 0.5,
-                    detector: TextMaskDetector.Options = .init(includeDetectionOnlyPass: false)) {
+                    detector: TextMaskDetector.Options = .init(includeDetectionOnlyPass: false),
+                    wordConfirmation: Bool = false) {
             self.granularity = granularity
             self.minimumConfidence = minimumConfidence
             self.minimumWordLength = minimumWordLength
@@ -102,6 +119,7 @@ public enum TextLegibilityGuard {
             self.documentMinimumWords = documentMinimumWords
             self.documentCertainShare = documentCertainShare
             self.detector = detector
+            self.wordConfirmation = wordConfirmation
         }
 
         public static let `default` = Policy()
@@ -124,6 +142,16 @@ public enum TextLegibilityGuard {
         /// True when the frame reads as a legible document page (≥ `documentMinimumWords` certain words on
         /// ≥ `documentCertainShare` of its lines) — a reported fact; it only routes when `documentGate` is on.
         public var isDocumentPage: Bool
+        /// After `confirm(_:with:policy:)`: the certain words the second reader also read (= `protected.count`
+        /// then) over the certain words Vision read before confirmation. `nil` when no second reader was applied.
+        public var confirmed: (words: Int, ofCertain: Int)? = nil
+
+        public static func == (lhs: Verdict, rhs: Verdict) -> Bool {
+            lhs.regions == rhs.regions && lhs.protected == rhs.protected && lhs.certainLineShare == rhs.certainLineShare
+                && lhs.documentGate == rhs.documentGate && lhs.wordProtection == rhs.wordProtection
+                && lhs.width == rhs.width && lhs.height == rhs.height && lhs.isDocumentPage == rhs.isDocumentPage
+                && lhs.confirmed?.words == rhs.confirmed?.words && lhs.confirmed?.ofCertain == rhs.confirmed?.ofCertain
+        }
 
         public var firesOnText: Bool { !protected.isEmpty }
         /// Fraction of the frame the protected quads cover (before dilation).
@@ -180,6 +208,55 @@ public enum TextLegibilityGuard {
 
     static func alphanumerics(_ s: String) -> Int {
         s.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.count
+    }
+
+    // MARK: - Word confirmation (agreement ensemble)
+
+    /// Keep only the protected words whose token the second reader also read — a multiset intersection on
+    /// normalised tokens (upper-cased, ASCII letters and digits only — the same rule the measurement used), with
+    /// Vision's quads kept. A word granularity verdict only; with `.line` or with `wordConfirmation` off the verdict
+    /// comes back unchanged and `confirmed` stays `nil`. The second reader's lines may contain degenerate repeats
+    /// (a greedy VLM loops); they do not matter here because confirmation only ever REMOVES words.
+    public static func confirm(_ verdict: Verdict, with secondReaderLines: [String],
+                               policy: Policy = .default) -> Verdict {
+        guard policy.wordConfirmation, policy.granularity == .word else { return verdict }
+        var available: [String: Int] = [:]
+        for line in secondReaderLines {
+            for word in line.split(whereSeparator: \.isWhitespace) {
+                let tok = normalisedToken(String(word))
+                if !tok.isEmpty { available[tok, default: 0] += 1 }
+            }
+        }
+        var out = verdict
+        out.protected = []
+        var certainWords = 0
+        for region in verdict.regions where region.confidence >= policy.minimumConfidence {
+            for word in region.words where alphanumerics(word.text) >= policy.minimumWordLength {
+                certainWords += 1
+                let tok = normalisedToken(word.text)
+                if let n = available[tok], n > 0 {
+                    available[tok] = n - 1
+                    out.protected.append(word.quad)
+                }
+            }
+        }
+        out.confirmed = (out.protected.count, certainWords)
+        return out
+    }
+
+    /// Run the second reader and confirm. Vision's assessment is done first by the caller (`assess`), so a reader
+    /// that fails or is absent degrades to Vision's verdict rather than failing the guard.
+    public static func confirm(_ verdict: Verdict, image: CGImage, reader: any TextSecondReader,
+                               policy: Policy = .default) async -> Verdict {
+        guard policy.wordConfirmation, policy.granularity == .word else { return verdict }
+        guard let lines = try? await reader.transcribe(image) else { return verdict }
+        return confirm(verdict, with: lines, policy: policy)
+    }
+
+    /// Upper-cased ASCII letters and digits only (`[^A-Z0-9]` stripped after `upper()`, as the measurement did).
+    static func normalisedToken(_ s: String) -> String {
+        String(s.uppercased().unicodeScalars.filter { ($0.value >= 65 && $0.value <= 90) || ($0.value >= 48 && $0.value <= 57) }
+            .map { Character($0) })
     }
 
     // MARK: - Mask
